@@ -1,14 +1,15 @@
 import re
 import gradio as gr
-import networkx as nx
 import spacy
-from concurrent.futures import ThreadPoolExecutor
+import networkx as nx
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_ollama import OllamaEmbeddings
 from chromadb.config import Settings
 from chromadb import Client
 from langchain_community.vectorstores import Chroma
+from langchain.graphs import Neo4jGraphStore
+from langchain.graph_transformers import LLMGraphTransformer
 
 # Load NLP model
 nlp = spacy.load("en_core_web_sm")
@@ -24,75 +25,50 @@ chunks = text_splitter.split_documents(documents)
 # Initialize embeddings
 embedding_function = OllamaEmbeddings(model="deepseek-r1")
 
-# Parallel embedding generation
-def generate_embedding(chunk):
-    return embedding_function.embed_query(chunk.page_content)
-
-with ThreadPoolExecutor() as executor:
-    embeddings = list(executor.map(generate_embedding, chunks))
-
-# Initialize Chroma client
+# Initialize ChromaDB
 client = Client(Settings())
 client.delete_collection(name="foundations_of_llms")
 collection = client.create_collection(name="foundations_of_llms")
 
-# Add documents and embeddings
+# Store document embeddings
 for idx, chunk in enumerate(chunks):
+    embedding = embedding_function.embed_query(chunk.page_content)
     collection.add(
         documents=[chunk.page_content],
         metadatas=[{'id': idx}],
-        embeddings=[embeddings[idx]],
+        embeddings=[embedding],
         ids=[str(idx)]
     )
 
-# Initialize retriever
 retriever = Chroma(collection_name="foundations_of_llms", client=client, embedding_function=embedding_function).as_retriever()
 
-# ================== Knowledge Graph ================== #
-knowledge_graph = nx.DiGraph()
+# ================== Neo4j Knowledge Graph ================== #
+neo4j_url = "bolt://localhost:7687"
+neo4j_user = "neo4j"
+neo4j_password = "password"
+neo4j_store = Neo4jGraphStore(url=neo4j_url, username=neo4j_user, password=neo4j_password)
 
-def extract_entities(text):
-    """Extract entities using spaCy"""
-    doc = nlp(text)
-    entities = [(ent.text, ent.label_) for ent in doc.ents]
-    return entities
-
-def build_knowledge_graph(chunks):
-    """Build Knowledge Graph from document chunks"""
-    for chunk in chunks:
-        entities = extract_entities(chunk.page_content)
-        for i in range(len(entities) - 1):
-            node1, type1 = entities[i]
-            node2, type2 = entities[i + 1]
-            if not knowledge_graph.has_edge(node1, node2):
-                knowledge_graph.add_edge(node1, node2, relation=f"{type1} → {type2}")
-
-# Build Knowledge Graph
-build_knowledge_graph(chunks)
+# Use LLMGraphTransformer to extract entities and relationships
+graph_transformer = LLMGraphTransformer()
+for chunk in chunks:
+    graph = graph_transformer.convert(chunk.page_content)
+    neo4j_store.add_graph(graph)
 
 def query_knowledge_graph(question):
-    """Check if any entity in the question exists in the graph"""
-    entities = extract_entities(question)
-    related_contexts = []
-
-    for entity, _ in entities:
-        if entity in knowledge_graph:
-            neighbors = list(knowledge_graph.neighbors(entity))
-            related_contexts.extend(neighbors)
-
-    return "\n".join(related_contexts)
+    """Query Neo4j Knowledge Graph"""
+    entities = nlp(question).ents
+    query = "MATCH (n)-[r]->(m) WHERE n.name IN $entities RETURN m.name"
+    results = neo4j_store.query(query, {"entities": [e.text for e in entities]})
+    return "\n".join([res["m.name"] for res in results])
 
 # ================== RAG Pipeline ================== #
 def retrieve_context(question):
-    """Retrieve relevant context using both Knowledge Graph & ChromaDB"""
     kg_context = query_knowledge_graph(question)
     db_results = retriever.invoke(question)
     db_context = "\n\n".join([doc.page_content for doc in db_results])
-    
     return f"KG Context:\n{kg_context}\n\nDB Context:\n{db_context}"
 
 def query_deepseek(question, context):
-    """Query DeepSeek-R1 model"""
     formatted_prompt = f"Question: {question}\n\nContext: {context}"
     response = embedding_function.chat(
         model="deepseek-r1",
@@ -103,7 +79,6 @@ def query_deepseek(question, context):
     return final_answer
 
 def ask_question(question):
-    """Pipeline to retrieve context and generate response"""
     context = retrieve_context(question)
     answer = query_deepseek(question, context)
     return answer
@@ -113,7 +88,7 @@ interface = gr.Interface(
     fn=ask_question,
     inputs="text",
     outputs="text",
-    title="RAG Chatbot with Knowledge Graph",
-    description="Ask questions about Foundations of LLMs. Uses both ChromaDB and a Knowledge Graph."
+    title="RAG Chatbot with Neo4j Knowledge Graph",
+    description="Ask questions about Foundations of LLMs. Uses ChromaDB and Neo4j Graph Store."
 )
 interface.launch()
